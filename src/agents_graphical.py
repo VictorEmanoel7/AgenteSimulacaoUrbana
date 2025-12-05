@@ -1,45 +1,38 @@
 """
-Implementação dos agentes gráficos e da lógica da simulação.
-
-Este módulo contém:
-- Funções utilitárias (por exemplo, cálculo de distância)
-- A classe Environment ControladorDeCruzamento que gerencia o semáforo
-  e publica percepções sobre o estado dos sinais.
-- AgenteCarro: agente que implementa comportamento de condução,
-  filas em semáforo, troca de faixa e negociação com pedestres.
-- AgentePessoa: agente pedestre que decide caminhos, solicita travessia
-  e negocia com carros.
-
-As classes usam a API do `maspy` (Agent, Environment, Belief, Goal, Percept, etc.)
-e compartilham um dicionário thread-safe com posições e estados.
+Módulo responsável pelos agentes (Carros e Pedestres) e o ambiente de controle de tráfego,
+integrando lógica de movimento, colisão e aprendizado por reforço (MASPY).
 """
 
 import time
 import threading
 import random
 import math
-from maspy import Agent, Environment, Belief, Goal, pl, gain, lose, Any, Percept, tell, achieve
+from maspy import *
+from maspy.learning import * 
 from . import settings
 
-# --- FUNÇÕES AUXILIARES ---
-"""Funções utilitárias pequenas usadas pelos agentes (mantêm-se puras e simples)."""
+MAPA_SEMAFOROS_TRAVESSIA = {
+    ("P1", "P2"): "semaforo_v", 
+    ("P2", "P1"): "semaforo_v",
+    ("P2", "P3"): "semaforo_h", 
+    ("P3", "P2"): "semaforo_h",
+}
+
 def calcular_distancia(pos1, pos2):
     """
-    Calcula a distância Euclidiana entre duas posições (pos1, pos2).
-
-    Retorna infinito se os argumentos forem inválidos, prevenindo exceções
-    quando valores inesperados forem lidos do estado compartilhado.
+    Calcula a distância euclidiana entre dois pontos (coordenadas x, y).
     """
-    if not pos1 or not pos2 or not isinstance(pos1, (tuple, list)) or not isinstance(pos2, (tuple, list)) or len(pos1) != 2 or len(pos2) != 2:
-        return float('inf')
+    if not pos1 or not pos2: return float('inf')
     try:
         return math.sqrt((pos1[0] - pos2[0])**2 + (pos1[1] - pos2[1])**2)
-    except (TypeError, IndexError):
+    except:
         return float('inf')
 
-# --- CONTROLADOR DE CRUZAMENTO (AMBIENTE) ---
-"""Environment que controla o ciclo dos semáforos e publica percepções."""
 class ControladorDeCruzamento(Environment):
+    """
+    Ambiente que gerencia os estados dos semáforos e define as regras 
+    de recompensa (SART) para o aprendizado dos agentes.
+    """
     def __init__(self, name, full_log=False):
         super().__init__(name, full_log)
         self.estado_compartilhado = None
@@ -47,757 +40,383 @@ class ControladorDeCruzamento(Environment):
 
     def setup(self, estado_compartilhado, lock):
         """
-        Inicializa o ambiente: registra percepções iniciais e
-        configura o estado compartilhado usado por agentes.
+        Inicializa os percepts do ambiente, estados iniciais e inicia 
+        a thread de controle dos semáforos.
         """
         self.estado_compartilhado = estado_compartilhado
         self.lock = lock
+        
+        self.create(Percept("sinal_visual", ("verde", "vermelho"), listed)) 
+        self.create(Percept("sinal_pedestre", ("livre", "fechado"), listed)) 
+        
+        self.possible_starts = {"sinal_visual": "vermelho", "sinal_pedestre": "livre"}
+        
         self.create(Percept("semaforo_v", "verde"))
         self.create(Percept("semaforo_h", "vermelho"))
+        self._up_visual("verde", "vermelho")
+        threading.Thread(target=self.trocar_sinal, daemon=True).start()
+
+    def transicao_trafego(self, state: dict, action: str):
+        """
+        Função de transição para o aprendizado dos carros. 
+        Define recompensas baseadas na obediência ao sinal.
+        """
+        cor_sinal = state["sinal_visual"]
+        reward = 0
+        terminated = True
+        
+        if action == "andar":
+            if cor_sinal == "vermelho": reward = -20
+            elif cor_sinal == "verde": reward = 10
+        elif action == "parar":
+            if cor_sinal == "vermelho": reward = 10
+            elif cor_sinal == "verde": reward = -5
+        return state, reward, terminated
+
+    @action(listed, ("parar", "andar"), transicao_trafego)
+    def decidir_movimento_carro(self, agent, acao_escolhida: str):
+        """
+        Ação abstrata decorada para o aprendizado do carro (SART).
+        """
+        pass
+
+    def transicao_pedestre(self, state: dict, action: str):
+        """
+        Função de transição para o aprendizado dos pedestres. 
+        Define recompensas baseadas na segurança da travessia.
+        """
+        status_sinal = state["sinal_pedestre"]
+        reward = 0
+        terminated = True
+
+        if action == "atravessar":
+            if status_sinal == "fechado": reward = -50 
+            elif status_sinal == "livre": reward = 20 
+        elif action == "esperar":
+            if status_sinal == "fechado": reward = 10 
+            elif status_sinal == "livre": reward = -5 
+        return state, reward, terminated
+
+    @action(listed, ("esperar", "atravessar"), transicao_pedestre)
+    def decidir_travessia(self, agent, acao_escolhida: str):
+        """
+        Ação abstrata decorada para o aprendizado do pedestre (SART).
+        """
+        pass
+
+    def _up_visual(self, v, h):
+        """
+        Atualiza o estado compartilhado com a interface gráfica de forma segura.
+        """
         if self.estado_compartilhado and self.lock:
             with self.lock:
-                self.estado_compartilhado['estado_semaforo_v'] = "verde"
-                self.estado_compartilhado['estado_semaforo_h'] = "vermelho"
-        threading.Thread(target=self.trocar_sinal, daemon=True).start()
+                self.estado_compartilhado['estado_semaforo_v'] = v
+                self.estado_compartilhado['estado_semaforo_h'] = h
 
     def trocar_sinal(self):
         """
-        Loop contínuo que altera os estados dos semáforos seguindo uma
-        sequência temporal predefinida (verde -> amarelo -> vermelho -> ...).
-        Atualiza tanto as percepções do ambiente quanto o estado compartilhado.
+        Loop infinito que alterna as cores dos semáforos e atualiza os percepts dos agentes.
+        Verifica a flag 'simulacao_ativa' para encerrar a thread corretamente.
         """
-        estados = [("verde", "vermelho"), ("amarelo", "vermelho"), ("vermelho", "verde"), ("vermelho", "amarelo")]
-        tempos = [5, 2, 5, 2]
-        indice_estado_atual = 0
+        ciclo = [
+            ("verde", "vermelho", 4),
+            ("amarelo", "vermelho", 2),
+            ("vermelho", "verde", 4),
+            ("vermelho", "amarelo", 2)
+        ]
+        idx = 0
         while True:
-            try:
-                estado_v, estado_h = estados[indice_estado_atual]
-                tempo_espera = tempos[indice_estado_atual]
-                percep_semaforo_v = self.get(Percept("semaforo_v", Any))
-                percep_semaforo_h = self.get(Percept("semaforo_h", Any))
-                if percep_semaforo_v and percep_semaforo_h:
-                    self.change(percep_semaforo_v, estado_v)
-                    self.change(percep_semaforo_h, estado_h)
-                    if self.estado_compartilhado and self.lock:
-                        with self.lock:
-                            self.estado_compartilhado['estado_semaforo_v'] = estado_v
-                            self.estado_compartilhado['estado_semaforo_h'] = estado_h
-                time.sleep(tempo_espera)
-                indice_estado_atual = (indice_estado_atual + 1) % len(estados)
-            except Exception:
-                break
+            if self.estado_compartilhado and not self.estado_compartilhado.get("simulacao_ativa", True):
+                break 
+            
+            v, h, t = ciclo[idx]
+            pv = self.get(Percept("semaforo_v", Any))
+            ph = self.get(Percept("semaforo_h", Any))
+            
+            try: p_carro = self.get(Percept("sinal_visual", Any))
+            except: p_carro = None
+            try: p_pedestre = self.get(Percept("sinal_pedestre", Any))
+            except: p_pedestre = None
+            
+            if pv and ph:
+                self.change(pv, v)
+                self.change(ph, h)
+                self._up_visual(v, h)
+                if p_carro:
+                    novo_estado_carro = "verde" if v == "verde" else "vermelho"
+                    self.change(p_carro, novo_estado_carro)
+                if p_pedestre:
+                    novo_estado_pedestre = "fechado" if v in ["verde", "amarelo"] else "livre"
+                    self.change(p_pedestre, novo_estado_pedestre)
+            time.sleep(t)
+            idx = (idx + 1) % len(ciclo)
 
-# --- AGENTE: CARRO ---
-"""Agente que representa um veículo com lógica de fila, troca de faixa,
-avaliação de pedidos de pedestres e prevenção de colisões."""
 class AgenteCarro(Agent):
-    def __init__(self, name, ponto_inicial, velocidade, estado_compartilhado, lock):
-        """
-        Inicializa um carro:
-        - name: identificador do agente
-        - ponto_inicial: nome do waypoint inicial (chave em PONTOS_DE_PASSAGEM_CARROS)
-        - velocidade: magnitude de deslocamento por passo
-        - estado_compartilhado, lock: dicionário thread-safe compartilhado com posições/estados
-        """
+    """
+    Agente que representa um veículo. Possui sistema de prevenção de colisão
+    e aprendizado por reforço para respeitar semáforos.
+    """
+    def __init__(self, name, ponto_inicial, velocidade, estado_compartilhado, lock, env_ref=None):
         super().__init__(name)
         self.ponto_atual = ponto_inicial
-        self.ponto_anterior = None
-        try:
-            self.posicao = settings.PONTOS_DE_PASSAGEM_CARROS[ponto_inicial]
-        except KeyError:
-            print(f"Ponto inicial '{ponto_inicial}' não encontrado para {self.my_name} !!!")
-            self.posicao = (settings.LARGURA_TELA // 2, settings.ALTURA_TELA // 2)
+        self.velocidade_base = velocidade
+        self.estado_compartilhado = estado_compartilhado
+        self.lock = lock
+        self.env_ref = env_ref
+        self.delay = 0.02
+        try: self.posicao = settings.PONTOS_DE_PASSAGEM_CARROS[ponto_inicial]
+        except: self.posicao = (0,0)
+        self.configurar_orientacao()
+        self.pontos_verificacao = ["H_MID_R", "H_MID_L", "V_MID_L", "V_MID_C", "V_MID_R"]
+        with self.lock:
+            self.estado_compartilhado[f'{self.my_name}_pos'] = self.posicao
+            self.estado_compartilhado[f'{self.my_name}_angle'] = self.angulo
+        self.modelo_transito = None
+        self.add(Goal("dirigir_e_treinar"))
+
+    def configurar_orientacao(self):
+        """
+        Define o ângulo e o eixo de movimento do carro com base no seu ponto de partida.
+        """
+        if self.ponto_atual.startswith("H_"):
+            self.sinal_nome = "semaforo_h"
+            self.linha_parada = 470
+            self.eixo_mov = 'x'
+            self.angulo = 90.0
+        else:
+            self.sinal_nome = "semaforo_v"
+            self.linha_parada = 420
+            self.eixo_mov = 'y'
+            self.angulo = 0.0
+
+    def verificar_frente_livre(self, pos_alvo):
+        """
+        Verifica se há risco de colisão com outro veículo à frente na mesma faixa de direção.
+        """
+        distancia_frenagem = 70 
+        largura_faixa = 20       
+        dx_move = pos_alvo[0] - self.posicao[0]
+        dy_move = pos_alvo[1] - self.posicao[1]
+
+        with self.lock:
+            snapshot = self.estado_compartilhado.copy()
+            
+        for key, pos_outro in snapshot.items():
+            if key.endswith("_pos") and "Carro" in key and self.my_name not in key:
+                if pos_outro:
+                    dx_rel = pos_outro[0] - self.posicao[0]
+                    dy_rel = pos_outro[1] - self.posicao[1]
+                    distancia_real = math.sqrt(dx_rel**2 + dy_rel**2)
+
+                    if distancia_real > distancia_frenagem: continue
+
+                    if abs(dx_move) > abs(dy_move):
+                        if abs(dy_rel) < largura_faixa:
+                            if (dx_move > 0 and dx_rel > 0) or (dx_move < 0 and dx_rel < 0):
+                                return False
+                    else:
+                        if abs(dx_rel) < largura_faixa:
+                            if (dy_move > 0 and dy_rel > 0) or (dy_move < 0 and dy_rel < 0):
+                                return False
+        return True
+
+    def mover_fisicamente(self, acao):
+        """
+        Calcula a nova posição do carro, aplicando restrições de colisão
+        e atualizando o estado visual.
+        """
+        if self.ponto_atual not in settings.CAMINHOS_CARROS: return
+        proximos = settings.CAMINHOS_CARROS.get(self.ponto_atual, [])
+        if not proximos:
+            starts = settings.PONTOS_INICIAIS_HORIZONTAIS if self.ponto_atual.startswith("H_") else settings.PONTOS_INICIAIS_VERTICAIS
+            self.ponto_atual = random.choice(starts)
+            self.posicao = settings.PONTOS_DE_PASSAGEM_CARROS[self.ponto_atual]
+            self.configurar_orientacao()
+            return
+
+        ponto_alvo_nome = proximos[0] 
+        pos_alvo = settings.PONTOS_DE_PASSAGEM_CARROS[ponto_alvo_nome]
+        
+        caminho_livre = self.verificar_frente_livre(pos_alvo)
+        
+        if acao == "parar" or not caminho_livre: vel = 0
+        else: vel = self.velocidade_base
+        
+        d_alvo = calcular_distancia(self.posicao, pos_alvo)
+        
+        if d_alvo < self.velocidade_base:
+            self.posicao = pos_alvo
+            self.ponto_atual = ponto_alvo_nome
+            return
+
+        if vel > 0:
+            dx = pos_alvo[0] - self.posicao[0]
+            dy = pos_alvo[1] - self.posicao[1]
+            dt = math.sqrt(dx**2 + dy**2)
+            if dt > 0:
+                mx = (dx/dt) * vel
+                my = (dy/dt) * vel
+                self.posicao = (self.posicao[0] + mx, self.posicao[1] + my)
+                self.angulo = math.degrees(math.atan2(-dy, dx)) - 90
+        
+        with self.lock:
+            self.estado_compartilhado[f'{self.my_name}_pos'] = self.posicao
+            self.estado_compartilhado[f'{self.my_name}_angle'] = self.angulo
+
+    @pl(gain, Goal("dirigir_e_treinar"))
+    def plano_dirigir_treinando(self, src):
+        """
+        Plano principal do carro: executa o treinamento (Q-Learning) em background
+        e depois assume o controle inteligente.
+        """
+        env = self.env_ref
+        if not env: return
+        self.modelo_transito = EnvModel(env)
+        
+        def thread_treino(modelo):
+            modelo.learn(qlearning, num_episodes=500)
+        
+        t_treino = threading.Thread(target=thread_treino, args=(self.modelo_transito,))
+        t_treino.start()
+
+        while t_treino.is_alive():
+            if not self.estado_compartilhado.get("simulacao_ativa", True): return True
+            
+            deve_pensar = self.ponto_atual in self.pontos_verificacao
+            pos_atual = self.posicao[0] if self.eixo_mov == 'x' else self.posicao[1]
+            
+            if (pos_atual - self.linha_parada) < 10: 
+                deve_pensar = False
+            
+            acao = "andar"
+            if deve_pensar: acao = random.choice(["andar", "parar"])
+            self.mover_fisicamente(acao)
+            time.sleep(self.delay)
+
+        while True:
+            if not self.estado_compartilhado.get("simulacao_ativa", True): return True
+
+            deve_pensar = self.ponto_atual in self.pontos_verificacao
+            pos_atual = self.posicao[0] if self.eixo_mov == 'x' else self.posicao[1]
+            
+            if (pos_atual - self.linha_parada) < 10: 
+                deve_pensar = False
+            
+            acao = "andar"
+            if deve_pensar:
+                sinal_alvo = "semaforo_v" if self.ponto_atual.startswith("V_") else "semaforo_h"
+                percep = self.get(Belief(sinal_alvo, Any, "Cruzamento"))
+                cor_real = "verde"
+                if percep:
+                    v = percep.values
+                    cor_real = v[0] if isinstance(v, tuple) else v
+                cor_consulta = cor_real.lower() if cor_real else "verde" 
+                if cor_consulta == "amarelo": cor_consulta = "vermelho"
+                estado_str = str(cor_consulta)
+                if hasattr(self.modelo_transito, 'q_table') and estado_str in self.modelo_transito.q_table:
+                    q_vals = self.modelo_transito.q_table[estado_str]
+                    acao = max(q_vals, key=q_vals.get)
+                else: acao = "parar" if cor_consulta == "vermelho" else "andar"
+            self.mover_fisicamente(acao)
+            time.sleep(self.delay)
+        return True
+
+class AgentePessoa(Agent):
+    """
+    Agente que representa um pedestre. Navega entre pontos seguros
+    e aprende a respeitar o sinal de travessia.
+    """
+    def __init__(self, name, ponto_inicial, velocidade, estado_compartilhado, lock, env_ref=None):
+        super().__init__(name)
+        self.ponto_atual = ponto_inicial
+        try: self.posicao = settings.PONTOS_DE_PASSAGEM_PEDESTRES[ponto_inicial]
+        except: self.posicao = (0,0)
         self.velocidade = velocidade
         self.estado_compartilhado = estado_compartilhado
         self.lock = lock
-        self.delay = 0.05
-        self.ponto_alvo_atual = None
-        with self.lock:
-            self.estado_compartilhado[f'{self.my_name}_pos'] = self.posicao
-        self.add(Goal("dirigir_para_proximo_ponto"))
-        self.id_pedestre_cedendo = None
-
-    def encontrar_carro_a_frente(self, ponto_parada_nome):
-        """
-        Localiza (se existir) a posição do carro mais próximo na fila à frente
-        entre a posição atual e o waypoint de parada especificado.
-
-        Retorna a posição do carro à frente ou None se não houver.
-        """
-        carro_frente_pos = None
-        min_dist_frente_parada = float('inf')
-
-        pos_parada_waypoint = settings.PONTOS_DE_PASSAGEM_CARROS.get(ponto_parada_nome)
-        if not pos_parada_waypoint:
-            return None
-
-        dist_atual_parada_waypoint = calcular_distancia(self.posicao, pos_parada_waypoint)
-
-        with self.lock:
-            estado_copia = self.estado_compartilhado.copy()
-
-        for key, pos_outro in estado_copia.items():
-            if key.startswith("Carro") and key.endswith("_pos") and key != f'{self.my_name}_pos':
-                mesma_faixa = False
-                if ponto_parada_nome.startswith("V_") and abs(pos_outro[0] - self.posicao[0]) < settings.LARGURA_CARRO * 0.5:
-                    if pos_outro[1] < self.posicao[1] and pos_outro[1] >= pos_parada_waypoint[1]:
-                        mesma_faixa = True
-                elif ponto_parada_nome.startswith("H_") and abs(pos_outro[1] - self.posicao[1]) < settings.ALTURA_CARRO * 0.25:
-                    if pos_outro[0] < self.posicao[0] and pos_outro[0] >= pos_parada_waypoint[0]:
-                        mesma_faixa = True
-
-                if mesma_faixa:
-                    dist_outro_parada_waypoint = calcular_distancia(pos_outro, pos_parada_waypoint)
-                    if dist_outro_parada_waypoint < dist_atual_parada_waypoint and dist_outro_parada_waypoint < min_dist_frente_parada:
-                        min_dist_frente_parada = dist_outro_parada_waypoint
-                        carro_frente_pos = pos_outro
-
-        return carro_frente_pos
-
-    def encontrar_obstaculo_imediato(self):
-        """
-        Detecta se existe um outro carro perigosamente perto na direção de movimento.
-        Retorna a posição do obstáculo se ele estiver dentro da distância de segurança,
-        caso contrário retorna None.
-        """
-        if not self.ponto_alvo_atual:
-            return None
-
-        pos_alvo = settings.PONTOS_DE_PASSAGEM_CARROS.get(self.ponto_alvo_atual)
-        if not pos_alvo:
-            return None
-
-        dx = pos_alvo[0] - self.posicao[0]
-        dy = pos_alvo[1] - self.posicao[1]
-
-        is_vertical = abs(dy) > abs(dx)
-        is_horizontal = abs(dx) > abs(dy)
-
-        dist_segura_frente = settings.ALTURA_CARRO * 0.9
-        dist_segura_lado = settings.LARGURA_CARRO * 0.5
-
-        if is_horizontal:
-            dist_segura_frente = settings.LARGURA_CARRO * 0.9
-            dist_segura_lado = settings.ALTURA_CARRO * 0.5
-
-        pos_obstaculo_proximo = None
-        menor_distancia = float('inf')
-
-        with self.lock:
-            estado_copia = self.estado_compartilhado.copy()
-
-        for key, pos_outro in estado_copia.items():
-            if key.startswith("Carro") and key.endswith("_pos") and key != f'{self.my_name}_pos':
-                dist_outro = calcular_distancia(self.posicao, pos_outro)
-                if dist_outro > dist_segura_frente * 2:
-                    continue
-
-                esta_a_frente = False
-                na_mesma_faixa = False
-
-                if is_vertical:
-                    na_mesma_faixa = abs(pos_outro[0] - self.posicao[0]) < dist_segura_lado
-                    if dy < 0:
-                        esta_a_frente = (pos_outro[1] < self.posicao[1])
-                    else:
-                        esta_a_frente = (pos_outro[1] > self.posicao[1])
-                elif is_horizontal:
-                    na_mesma_faixa = abs(pos_outro[1] - self.posicao[1]) < dist_segura_lado
-                    if dx < 0:
-                        esta_a_frente = (pos_outro[0] < self.posicao[0])
-                    else:
-                        esta_a_frente = (pos_outro[0] > self.posicao[0])
-
-                if esta_a_frente and na_mesma_faixa:
-                    if dist_outro < menor_distancia:
-                        menor_distancia = dist_outro
-                        pos_obstaculo_proximo = pos_outro
-
-        if pos_obstaculo_proximo and menor_distancia < dist_segura_frente:
-            return pos_obstaculo_proximo
-
-        return None
-
-    def verificar_faixa_alvo(self, ponto_atual, ponto_alvo_troca):
-        """
-        Verifica se a faixa alvo está livre para troca de faixa.
-        Retorna True se livre, False se ocupada.
-        """
-        faixa_actual_x = settings.PONTOS_DE_PASSAGEM_CARROS[ponto_atual][0]
-        faixa_alvo_x = settings.PONTOS_DE_PASSAGEM_CARROS[ponto_alvo_troca][0]
-        faixa_actual_y = settings.PONTOS_DE_PASSAGEM_CARROS[ponto_atual][1]
-        faixa_alvo_y = settings.PONTOS_DE_PASSAGEM_CARROS[ponto_alvo_troca][1]
-        with self.lock:
-            estado_copia = self.estado_compartilhado.copy()
-        for key, pos_outro in estado_copia.items():
-            if key.startswith("Carro") and key.endswith("_pos") and key != f'{self.my_name}_pos':
-                distancia_relativa = calcular_distancia(self.posicao, pos_outro)
-                if distancia_relativa < settings.DISTANCIA_VERIFICACAO_TROCA_FAIXA:
-                    if ponto_atual.startswith("V_") and abs(pos_outro[0] - faixa_alvo_x) < settings.LARGURA_CARRO / 2:
-                        if pos_outro[1] > self.posicao[1] - settings.ALTURA_CARRO and pos_outro[1] < self.posicao[1] + settings.DISTANCIA_VERIFICACAO_TROCA_FAIXA:
-                            return False
-                    elif ponto_atual.startswith("H_") and abs(pos_outro[1] - faixa_alvo_y) < settings.ALTURA_CARRO / 2:
-                        if pos_outro[0] > self.posicao[0] - settings.LARGURA_CARRO and pos_outro[0] < self.posicao[0] + settings.DISTANCIA_VERIFICACAO_TROCA_FAIXA:
-                            return False
-        return True
-
-    def verificar_pedestre_na_passadeira(self, ponto_avaliacao_nome):
-        """
-        Verifica se há *qualquer* pedestre fisicamente dentro da zona de 
-        passadeira associada ao 'ponto_avaliacao_nome'.
-        Retorna True se um pedestre for encontrado, False caso contrário.
-        """
-        zona_relevante = settings.MAPA_AVALIACAO_PASSADEIRA.get(ponto_avaliacao_nome)
-        if not zona_relevante:
-            return False 
-
-        xmin, xmax, ymin, ymax = zona_relevante
-        
-        with self.lock:
-            estado_copia = self.estado_compartilhado.copy()
-
-        for key, pos in estado_copia.items():
-            if key.startswith("Pessoa") and key.endswith("_pos"):
-                if (xmin <= pos[0] <= xmax and ymin <= pos[1] <= ymax):
-                    return True 
-
-        return False 
-
-    @pl(gain, Goal("dirigir_para_proximo_ponto"))
-    def plano_dirigir(self, src):
-        """
-        Plano principal que faz o carro:
-        - avaliar semáforo e fila
-        - lidar com obstáculos imediatos
-        - negociar com pedestres (receber pedidos, ceder, monitorar)
-        - verificar segurança da passadeira (NOVO)
-        - escolher e percorrer o próximo waypoint
-        """
-        crenca_cedendo = self.get(Belief(settings.NOME_CRENCA_CARRO_CEDENDO, Any))
-        if crenca_cedendo:
-            self.add(Goal("monitorar_pedestre_cedendo", crenca_cedendo.args))
-            return True
-
-        parar_no_semaforo = False
-        ponto_de_parada_alvo = None
-        ponto_parada_waypoint_nome = None
-
-        if self.ponto_atual in settings.PONTOS_DE_PARADA:
-            ponto_parada_waypoint_nome = self.ponto_atual
-        elif self.ponto_alvo_atual in settings.PONTOS_DE_PARADA:
-            ponto_parada_waypoint_nome = self.ponto_alvo_atual
-
-        if ponto_parada_waypoint_nome:
-            semaforo_a_verificar = None
-            if ponto_parada_waypoint_nome.startswith("V_"):
-                semaforo_a_verificar = "semaforo_v"
-            elif ponto_parada_waypoint_nome.startswith("H_"):
-                semaforo_a_verificar = "semaforo_h"
-
-            if semaforo_a_verificar:
-                crenca_semaforo = self.get(Belief(semaforo_a_verificar, Any, "Cruzamento"))
-                cor_sinal = "desconhecido"
-                if crenca_semaforo:
-                    cor_sinal = crenca_semaforo.args
-
-                pos_carro_frente_fila = self.encontrar_carro_a_frente(ponto_parada_waypoint_nome)
-
-                if pos_carro_frente_fila:
-                    parar_no_semaforo = True
-                    if ponto_parada_waypoint_nome.startswith("V_"):
-                        ponto_de_parada_alvo = (pos_carro_frente_fila[0], pos_carro_frente_fila[1] + settings.ALTURA_CARRO + settings.DISTANCIA_SEGURA_SEMAFORO)
-                    elif ponto_parada_waypoint_nome.startswith("H_"):
-                        ponto_de_parada_alvo = (pos_carro_frente_fila[0] + settings.LARGURA_CARRO + settings.DISTANCIA_SEGURA_SEMAFORO, pos_carro_frente_fila[1])
-                elif cor_sinal in ["vermelho", "amarelo"]:
-                    parar_no_semaforo = True
-                    ponto_de_parada_alvo = settings.PONTOS_DE_PASSAGEM_CARROS[ponto_parada_waypoint_nome]
-
-                if parar_no_semaforo:
-                    if ponto_de_parada_alvo and calcular_distancia(self.posicao, ponto_de_parada_alvo) < self.velocidade * 0.5:
-                        self.add(Goal("dirigir_para_proximo_ponto"))
-                        return True
-
-        proximos_pontos_possiveis = settings.CAMINHOS_CARROS.get(self.ponto_atual, [])[:]
-        if not proximos_pontos_possiveis:
-            novo_ponto_inicial = None
-            if self.ponto_atual.startswith("V_END"):
-                novo_ponto_inicial = random.choice(settings.PONTOS_INICIAIS_VERTICAIS)
-            elif self.ponto_atual.startswith("H_END"):
-                novo_ponto_inicial = random.choice(settings.PONTOS_INICIAIS_HORIZONTAIS)
-            else:
-                todos_inicios = settings.PONTOS_INICIAIS_VERTICAIS + settings.PONTOS_INICIAIS_HORIZONTAIS
-                novo_ponto_inicial = random.choice(todos_inicios)
-            self.ponto_anterior = self.ponto_atual
-            self.ponto_atual = novo_ponto_inicial
-            self.ponto_alvo_atual = None
-            try:
-                self.posicao = settings.PONTOS_DE_PASSAGEM_CARROS[novo_ponto_inicial]
-            except KeyError:
-                print(f"Novo ponto inicial '{novo_ponto_inicial}' não encontrado !!!")
-                self.posicao = (settings.LARGURA_TELA/2, settings.ALTURA_TELA/2)
-                self.stop_cycle()
-                return True
-            with self.lock:
-                self.estado_compartilhado[f'{self.my_name}_pos'] = self.posicao
-            self.add(Goal("dirigir_para_proximo_ponto"))
-            return True
-
-        ponto_alvo_nome = None
-        opcoes_validas = proximos_pontos_possiveis[:]
-        if self.ponto_anterior in opcoes_validas and len(opcoes_validas) > 1:
-            opcoes_validas.remove(self.ponto_anterior)
-        if not opcoes_validas:
-            opcoes_validas = proximos_pontos_possiveis
-
-        if not ponto_de_parada_alvo:
-            if not opcoes_validas:
-                self.add(Goal("dirigir_para_proximo_ponto"))
-                return True
-            ponto_alvo_nome = random.choice(opcoes_validas)
-            self.ponto_alvo_atual = ponto_alvo_nome
-        else:
-            ponto_alvo_nome = ponto_parada_waypoint_nome
-
-        if not ponto_alvo_nome:
-            self.add(Goal("dirigir_para_proximo_ponto"))
-            return True
-
-        e_troca_faixa = False
-        if len(self.ponto_atual) > 2 and len(ponto_alvo_nome) > 2:
-            if self.ponto_atual[:-1] == ponto_alvo_nome[:-1] and self.ponto_atual[-1] != ponto_alvo_nome[-1]:
-                e_troca_faixa = True
-            elif self.ponto_atual.startswith("H_") and ponto_alvo_nome.startswith("H_") and self.ponto_atual[-1] != ponto_alvo_nome[-1]:
-                e_troca_faixa = True
-        if e_troca_faixa:
-            faixa_livre = self.verificar_faixa_alvo(self.ponto_atual, ponto_alvo_nome)
-            if not faixa_livre:
-                self.wait(settings.TEMPO_ESPERA_TROCA_FAIXA)
-                self.ponto_alvo_atual = None
-                self.add(Goal("dirigir_para_proximo_ponto"))
-                return True
-
-        if ponto_de_parada_alvo:
-            posicao_alvo = ponto_de_parada_alvo
-        else:
-            try:
-                posicao_alvo = settings.PONTOS_DE_PASSAGEM_CARROS[ponto_alvo_nome]
-            except KeyError:
-                print(f"ERRO: {self.my_name} alvo inválido '{ponto_alvo_nome}'.")
-                self.ponto_alvo_atual = None
-                self.add(Goal("dirigir_para_proximo_ponto"))
-                return True
-
-        LIMIAR_CHEGADA = self.velocidade * 0.5
-        while True:
-            distancia = calcular_distancia(self.posicao, posicao_alvo)
-
-            if distancia < LIMIAR_CHEGADA:
-                self.posicao = posicao_alvo
-                break
-
-            if self.encontrar_obstaculo_imediato():
-                self.add(Goal("dirigir_para_proximo_ponto"))
-                return True
-
-            if self.has(Belief(settings.NOME_CRENCA_CARRO_CEDENDO, Any)):
-                self.add(Goal("monitorar_pedestre_cedendo", self.get(Belief(settings.NOME_CRENCA_CARRO_CEDENDO, Any)).args))
-                self.ponto_alvo_atual = None
-                return True
-
-            # --- INÍCIO DA CORREÇÃO (LÓGICA DO USUÁRIO) ---
-            
-            # 1. O carro está se aproximando de uma zona de avaliação?
-            estamos_na_zona_de_avaliacao = (self.ponto_atual in settings.PONTOS_AVALIACAO_CARRO or 
-                                             ponto_alvo_nome in settings.PONTOS_AVALIACAO_CARRO)
-
-            if estamos_na_zona_de_avaliacao and distancia < settings.DISTANCIA_SEGURA_CARRO_PEDESTRE:
-                
-                # 2. Descobrir qual é a zona relevante
-                ponto_de_avaliacao_relevante = ponto_alvo_nome if ponto_alvo_nome in settings.PONTOS_AVALIACAO_CARRO else self.ponto_atual
-                zona_relevante = settings.MAPA_AVALIACAO_PASSADEIRA.get(ponto_de_avaliacao_relevante)
-
-                if zona_relevante:
-                    x_carro, y_carro = self.posicao
-                    xmin, xmax, ymin, ymax = zona_relevante
-                    
-                    # 3. O carro JÁ PASSOU da zona?
-                    carro_ainda_nao_passou = False
-                    if ponto_de_avaliacao_relevante.startswith("H_") or ponto_de_avaliacao_relevante.startswith("PX1_EVAL_H"):
-                        # Carro Horizontal (direita->esquerda), só para se X_carro >= X_min_zona
-                        if x_carro >= xmin:
-                            carro_ainda_nao_passou = True
-                    elif ponto_de_avaliacao_relevante.startswith("V_") or ponto_de_avaliacao_relevante.startswith("PX1_EVAL_V"):
-                        # Carro Vertical (baixo->cima, Y decrescente), só para se Y_carro >= Y_min_zona
-                        if y_carro >= ymin:
-                            carro_ainda_nao_passou = True
-
-                    # 4. Só ativa a lógica de parada se o carro AINDA NÃO PASSOU
-                    if carro_ainda_nao_passou:
-                        
-                        # Checagem 1: Pedido de Negociação
-                        pedido_pendente = self.get(Belief(settings.NOME_CRENCA_CARRO_PEDESTRE_PEDINDO, Any))
-                        if pedido_pendente:
-                            id_pedestre = pedido_pendente.args
-                            self.add(Goal("avaliar_pedido_travessia", (id_pedestre, ponto_de_avaliacao_relevante))) 
-                            self.ponto_alvo_atual = None 
-                            return True # Para para negociar
-
-                        # Checagem 2: Radar de Segurança
-                        if self.verificar_pedestre_na_passadeira(ponto_de_avaliacao_relevante):
-                            self.wait(0.2) 
-                            self.add(Goal("dirigir_para_proximo_ponto")) 
-                            return True # Para por segurança
-            
-            # --- FIM DA CORREÇÃO ---
-
-
-            # Se passou por tudo, move o carro
-            x_atual, y_atual = self.posicao
-            x_alvo, y_alvo = posicao_alvo
-            if distancia == 0:
-                break
-            fator_mov_x = ((x_alvo - x_atual) / distancia) * self.velocidade
-            fator_mov_y = ((y_alvo - y_atual) / distancia) * self.velocidade
-            self.posicao = (x_atual + fator_mov_x, y_atual + fator_mov_y)
-
-            with self.lock:
-                self.estado_compartilhado[f'{self.my_name}_pos'] = self.posicao
-            time.sleep(self.delay)
-
-        with self.lock:
-            self.estado_compartilhado[f'{self.my_name}_pos'] = self.posicao
-
-        if parar_no_semaforo:
-            self.add(Goal("dirigir_para_proximo_ponto"))
-        else:
-            self.ponto_anterior = self.ponto_atual
-            self.ponto_atual = ponto_alvo_nome
-            self.ponto_alvo_atual = None
-            self.add(Goal("dirigir_para_proximo_ponto"))
-        return True
-
-    # --- Planos de negociação com pedestre ---
-    @pl(gain, Goal(settings.NOME_GOAL_PEDESTRE_PEDE_PASSAGEM, Any))
-    def plano_receber_pedido_travessia(self, src_pedestre, id_pedestre):
-        if self.has(Belief(settings.NOME_CRENCA_CARRO_PEDESTRE_PEDINDO, Any)) or self.has(Belief(settings.NOME_CRENCA_CARRO_CEDENDO, Any)):
-            return True
-        self.add(Belief(settings.NOME_CRENCA_CARRO_PEDESTRE_PEDINDO, id_pedestre))
-        return True
-
-    @pl(gain, Goal("avaliar_pedido_travessia", (Any, Any)))
-    def plano_avaliar_pedido(self, src, args):
-        id_pedestre, ponto_avaliacao = args 
-        
-        decisao_ceder = True
-        if decisao_ceder:
-            self.add(Belief(settings.NOME_CRENCA_CARRO_CEDENDO, (id_pedestre, ponto_avaliacao)))
-            self.send(id_pedestre, tell, Belief(settings.NOME_CRENCA_RESPOSTA_CARRO, ("concedida", self.my_name)))
-            self.add(Goal("monitorar_pedestre_cedendo", (id_pedestre, ponto_avaliacao)))
-        else:
-            self.send(id_pedestre, tell, Belief(settings.NOME_CRENCA_RESPOSTA_CARRO, ("negada", self.my_name)))
-            self.add(Goal("dirigir_para_proximo_ponto"))
-        
-        pedido = self.get(Belief(settings.NOME_CRENCA_CARRO_PEDESTRE_PEDINDO, id_pedestre))
-        if pedido:
-            self.rm(pedido)
-        return True
-
-    @pl(gain, Goal("monitorar_pedestre_cedendo", (Any, Any)))
-    def plano_monitorar_pedestre(self, src, args):
-        id_pedestre, ponto_avaliacao = args 
-        
-        pos_pedestre = None
-        with self.lock:
-            pos_pedestre = self.estado_compartilhado.get(f'{id_pedestre}_pos')
-        
-        cedendo = self.get(Belief(settings.NOME_CRENCA_CARRO_CEDENDO, (id_pedestre, ponto_avaliacao)))
-        
-        if pos_pedestre:
-            zona_relevante = settings.MAPA_AVALIACAO_PASSADEIRA.get(ponto_avaliacao)
-            esta_na_passadeira_relevante = False
-            
-            if zona_relevante:
-                xmin, xmax, ymin, ymax = zona_relevante
-                esta_na_passadeira_relevante = (xmin <= pos_pedestre[0] <= xmax and ymin <= pos_pedestre[1] <= ymax)
-            else:
-                if cedendo:
-                    self.rm(cedendo)
-                self.add(Goal("dirigir_para_proximo_ponto"))
-                return True
-
-            if not esta_na_passadeira_relevante:
-                if cedendo:
-                    self.rm(cedendo)
-                self.add(Goal("dirigir_para_proximo_ponto"))
-                return True
-            else:
-                self.wait(0.5)
-                self.add(Goal("monitorar_pedestre_cedendo", (id_pedestre, ponto_avaliacao))) 
-                return True
-        else:
-            if cedendo:
-                self.rm(cedendo)
-            self.add(Goal("dirigir_para_proximo_ponto"))
-            return True
-        return True
-
-# --- AGENTE: PESSOA ---
-"""Agente que representa um pedestre com capacidade de:
-- decidir movimentos
-- solicitar travessia
-- aguardar resposta do carro e reagir ao resultado
-"""
-class AgentePessoa(Agent):
-    def __init__(self, name, ponto_inicial, velocidade, estado_compartilhado, lock):
-        """
-        Inicializa um pedestre:
-        - name: identificador do agente
-        - ponto_inicial: waypoint inicial em PONTOS_DE_PASSAGEM_PEDESTRES
-        - velocidade: passo de deslocamento
-        - estado_compartilhado, lock: dicionário compartilhado para posições/estados
-        """
-        super().__init__(name)
-        self.ponto_atual = ponto_inicial
-        try:
-            self.posicao = settings.PONTOS_DE_PASSAGEM_PEDESTRES[ponto_inicial]
-        except KeyError:
-            print(f"Ponto inicial '{ponto_inicial}' não encontrado para {self.my_name} !!!")
-            self.posicao = (settings.LARGURA_TELA // 4, settings.ALTURA_TELA // 4)
-        self.velocidade = abs(velocidade)
-        self.chave_estado_compartilhado = f"{self.my_name}_pos"
-        self.estado_compartilhado = estado_compartilhado
-        self.lock = lock
+        self.env_ref = env_ref
         self.delay = 0.1
-        self.carro_negociando = None
+        self.proximo_destino_nome = None 
+        self.atravessando = False 
         with self.lock:
-            self.estado_compartilhado[self.chave_estado_compartilhado] = self.posicao
-        self.add(Goal("decidir_movimento"))
+            self.estado_compartilhado[f"{self.my_name}_pos"] = self.posicao
+        self.modelo_pedestre = None
+        self.add(Goal("andar_e_treinar"))
 
-    @pl(gain, Goal("decidir_movimento"))
-    def plano_decidir_movimento(self, src):
+    def escolher_proximo_destino(self):
         """
-        Decide o próximo movimento do pedestre:
-        - se aguarda resposta de carro, continua aguardando
-        - se tem permissão para atravessar, inicia travessia
-        - caso contrário, escolhe um próximo waypoint aleatório
+        Seleciona aleatoriamente o próximo ponto de passagem válido no grafo de caminhos.
         """
-        if self.has(Belief("crenca_aguardando_resposta_carro")):
-            self.add(Goal("aguardar_resposta"))
-            return True
+        proximos = settings.CAMINHOS_PEDESTRES.get(self.ponto_atual, [])
+        if not proximos: return None
+        return random.choice(proximos)
 
-        tem_permissao = self.has(Belief(settings.NOME_CRENCA_PEDESTRE_PODE_ATRAVESSAR))
-        em_ponto_espera = self.ponto_atual in settings.PONTOS_ESPERA_PEDESTRE
-
-        if tem_permissao and em_ponto_espera:
-            caminho_travessia = []
-            if self.ponto_atual == "P1": caminho_travessia = ["P4"]
-            elif self.ponto_atual == "P4": caminho_travessia = ["P1"]
-            elif self.ponto_atual == "P2": caminho_travessia = ["P3"]
-            elif self.ponto_atual == "P3": caminho_travessia = ["P2"]
-            elif self.ponto_atual == "P4": caminho_travessia = ["P3"]
-            elif self.ponto_atual == "P3": caminho_travessia = ["P4"]
-            elif self.ponto_atual == "P1": caminho_travessia = ["P2"]
-            elif self.ponto_atual == "P2": caminho_travessia = ["P1"]
-
-            if caminho_travessia:
-                ponto_alvo_nome = random.choice(caminho_travessia) 
-                self.add(Goal("executar_movimento", ponto_alvo_nome))
-                return True
-            else:
-                permissao = self.get(Belief(settings.NOME_CRENCA_PEDESTRE_PODE_ATRAVESSAR))
-                if permissao:
-                    self.rm(permissao)
-                self.add(Goal("decidir_movimento")) 
-                return True
-
-        proximos_pontos = settings.CAMINHOS_PEDESTRES.get(self.ponto_atual, [])[:]
-        if not proximos_pontos:
-            self.wait(random.uniform(2.0, 5.0))
-            self.add(Goal("decidir_movimento"))
-            return True
-
-        ponto_alvo_nome = random.choice(proximos_pontos)
-        try:
-            posicao_alvo = settings.PONTOS_DE_PASSAGEM_PEDESTRES[ponto_alvo_nome]
-        except KeyError:
-            self.add(Goal("decidir_movimento"))
-            return True
-
-        tentando_atravessar = False
-        if em_ponto_espera:
-            if (self.ponto_atual == "P1" and ponto_alvo_nome == "P4") or \
-               (self.ponto_atual == "P4" and ponto_alvo_nome == "P1") or \
-               (self.ponto_atual == "P2" and ponto_alvo_nome == "P3") or \
-               (self.ponto_atual == "P3" and ponto_alvo_nome == "P2"):
-                tentando_atravessar = True
-
-
-        if tentando_atravessar and em_ponto_espera:
-            carro_proximo = self.encontrar_carro_proximo()
-            if carro_proximo:
-                id_carro, dist = carro_proximo
-                self.carro_negociando = id_carro
-                self.add(Goal("pedir_permissao_travessia", id_carro))
-                self.add(Belief("crenca_aguardando_resposta_carro"))
-                self.add(Goal("aguardar_resposta"))
-                return True
-            else:
-                self.add(Belief(settings.NOME_CRENCA_PEDESTRE_PODE_ATRAVESSAR))
-                self.add(Goal("executar_movimento", ponto_alvo_nome))
-                return True
+    def mover_fisicamente(self, acao):
+        """
+        Controla o movimento do pedestre, impedindo paradas no meio da rua 
+        após iniciar a travessia (lógica de trava).
+        """
+        if acao == "esperar" and not self.atravessando: return
+        if not self.proximo_destino_nome:
+            self.proximo_destino_nome = self.escolher_proximo_destino()
+            if not self.proximo_destino_nome: 
+                self.wait(1)
+                return
+        self.atravessando = True
+        pos_alvo = settings.PONTOS_DE_PASSAGEM_PEDESTRES[self.proximo_destino_nome]
+        dist = calcular_distancia(self.posicao, pos_alvo)
+        if dist > self.velocidade:
+            mx = ((pos_alvo[0]-self.posicao[0])/dist)*self.velocidade
+            my = ((pos_alvo[1]-self.posicao[1])/dist)*self.velocidade
+            self.posicao = (self.posicao[0]+mx, self.posicao[1]+my)
         else:
-            self.add(Goal("executar_movimento", ponto_alvo_nome))
-            return True
+            self.posicao = pos_alvo
+            self.ponto_atual = self.proximo_destino_nome
+            self.proximo_destino_nome = None
+            self.atravessando = False 
+        with self.lock:
+            self.estado_compartilhado[f"{self.my_name}_pos"] = self.posicao
 
-    @pl(gain, Goal("executar_movimento", Any))
-    def plano_executar_movimento(self, src, ponto_alvo_nome):
+    @pl(gain, Goal("andar_e_treinar"))
+    def plano_pedestre_treinando(self, src):
         """
-        Move o pedestre até o waypoint alvo. Se é uma passadeira (PX) e não possui
-        permissão, cancela o movimento.
+        Plano principal do pedestre: executa o treinamento e controla a decisão
+        de atravessar ou esperar com base no aprendizado.
         """
-        try:
-            posicao_alvo = settings.PONTOS_DE_PASSAGEM_PEDESTRES[ponto_alvo_nome]
-        except KeyError:
-            self.add(Goal("decidir_movimento"))
-            return True
-            
-        em_ponto_espera = self.ponto_atual in settings.PONTOS_ESPERA_PEDESTRE
-        e_travessia = False
-        if em_ponto_espera:
-            if (self.ponto_atual == "P1" and ponto_alvo_nome == "P4") or \
-               (self.ponto_atual == "P4" and ponto_alvo_nome == "P1") or \
-               (self.ponto_atual == "P2" and ponto_alvo_nome == "P3") or \
-               (self.ponto_atual == "P3" and ponto_alvo_nome == "P2"):
-                e_travessia = True
+        env = self.env_ref
+        if not env: return
+        self.modelo_pedestre = EnvModel(env)
+        def thread_treino(modelo):
+            modelo.learn(qlearning, num_episodes=400)
+        t_treino = threading.Thread(target=thread_treino, args=(self.modelo_pedestre,))
+        t_treino.start()
 
-        if e_travessia and not self.has(Belief(settings.NOME_CRENCA_PEDESTRE_PODE_ATRAVESSAR)):
-            self.add(Goal("decidir_movimento"))
-            return True
-
-        DISTANCIA_CHEGADA = self.velocidade * 0.5
-        while calcular_distancia(self.posicao, posicao_alvo) > DISTANCIA_CHEGADA:
-            x_atual, y_atual = self.posicao
-            x_alvo, y_alvo = posicao_alvo
-            dx, dy = x_alvo - x_atual, y_alvo - y_atual
-            distancia_actual = calcular_distancia(self.posicao, posicao_alvo)
-            if distancia_actual == 0:
-                break
-            passo_x = (dx / distancia_actual) * self.velocidade
-            passo_y = (dy / distancia_actual) * self.velocidade
-            self.posicao = (x_atual + passo_x, y_atual + passo_y)
-            with self.lock:
-                self.estado_compartilhado[self.chave_estado_compartilhado] = self.posicao
+        while t_treino.is_alive():
+            if not self.estado_compartilhado.get("simulacao_ativa", True): return True
+            if not self.atravessando: acao = random.choice(["esperar", "atravessar"])
+            else: acao = "atravessar"
+            self.mover_fisicamente(acao)
             time.sleep(self.delay)
-
-        self.posicao = posicao_alvo
-        with self.lock:
-            self.estado_compartilhado[self.chave_estado_compartilhado] = self.posicao
-        self.ponto_atual = ponto_alvo_nome
-
-        permissao = self.get(Belief(settings.NOME_CRENCA_PEDESTRE_PODE_ATRAVESSAR))
-        if permissao:
-            self.rm(permissao)
-
-        self.add(Goal("decidir_movimento"))
+            
+        while True:
+            if not self.estado_compartilhado.get("simulacao_ativa", True): return True
+            acao = "atravessar" 
+            if not self.atravessando:
+                if not self.proximo_destino_nome:
+                    self.proximo_destino_nome = self.escolher_proximo_destino()
+                chave_travessia = (self.ponto_atual, self.proximo_destino_nome)
+                if chave_travessia in MAPA_SEMAFOROS_TRAVESSIA:
+                    nome_semaforo_carro = MAPA_SEMAFOROS_TRAVESSIA[chave_travessia]
+                    percep = self.get(Belief(nome_semaforo_carro, Any, "Cruzamento"))
+                    cor_carro = "verde"
+                    if percep:
+                        v = percep.values
+                        cor_carro = v[0] if isinstance(v, tuple) else v
+                    sinal_pedestre_local = "fechado" if cor_carro in ["verde", "amarelo"] else "livre"
+                    if hasattr(self.modelo_pedestre, 'q_table'):
+                        q_vals = self.modelo_pedestre.q_table.get(sinal_pedestre_local)
+                        if q_vals: acao = max(q_vals, key=q_vals.get)
+                        else: acao = "esperar" if sinal_pedestre_local == "fechado" else "atravessar"
+            self.mover_fisicamente(acao)
+            time.sleep(self.delay)
         return True
-
-    @pl(gain, Goal("aguardar_sinal_pedestre"))
-    def plano_aguardar_sinal(self, src):
-        """
-        Plano auxiliar para aguardar semáforo de pedestres (mantido por compatibilidade).
-        Verifica o estado do semáforo relevante e decide quando prosseguir.
-        """
-        semaforo_relevante = "semaforo_h"
-        crenca_semaforo = self.get(Belief(semaforo_relevante, Any, "Cruzamento"))
-        cor_semaforo = "desconhecido"
-        if crenca_semaforo:
-            cor_semaforo = crenca_semaforo.args
-        if cor_semaforo == "vermelho":
-            self.add(Goal("decidir_movimento"))
-            return True
-        else:
-            self.wait(0.5)
-            self.add(Goal("aguardar_sinal_pedestre"))
-            return True
-
-    @pl(gain, Goal("pedir_permissao_travessia", Any))
-    def plano_pedir_permissao(self, src, id_carro):
-        """
-        Envia um pedido de travessia (Goal) ao carro identificado.
-        """
-        self.send(id_carro, achieve, Goal(settings.NOME_GOAL_PEDESTRE_PEDE_PASSAGEM, self.my_name))
-        return True
-
-    @pl(gain, Belief(settings.NOME_CRENCA_RESPOSTA_CARRO, (Any, Any)))
-    def plano_processar_resposta_carro(self, src_carro, resposta_tupla):
-        """
-        Processa a resposta do carro à solicitação de travessia.
-        Atualiza crenças e objetivos do pedestre conforme a resposta.
-        """
-        resposta, id_carro_resp = resposta_tupla
-        if id_carro_resp != self.carro_negociando:
-            return True
-
-        aguardando = self.get(Belief("crenca_aguardando_resposta_carro"))
-        if aguardando:
-            self.rm(aguardando)
-
-        self.carro_negociando = None
-        if resposta == "concedida":
-            self.add(Belief(settings.NOME_CRENCA_PEDESTRE_PODE_ATRAVESSAR))
-        else:
-            self.add(Goal("aguardar_antes_de_tentar_novamente"))
-            return True
-
-        self.add(Goal("decidir_movimento"))
-        return True
-
-    @pl(gain, Goal("aguardar_resposta"))
-    def plano_aguardar_resposta(self, src):
-        """
-        Aguarda por uma resposta do carro por um tempo máximo; se o tempo expirar,
-        cancela a espera e volta a decidir.
-        """
-        if not self.has(Belief("crenca_aguardando_resposta_carro")):
-            self.add(Goal("decidir_movimento"))
-            return True
-
-        tempo_espera_max = 3.0
-        self.wait(tempo_espera_max)
-
-        aguardando = self.get(Belief("crenca_aguardando_resposta_carro"))
-        if aguardando:
-            self.rm(aguardando)
-            self.carro_negociando = None
-            self.add(Goal("decidir_movimento"))
-        return True
-
-    @pl(gain, Goal("aguardar_antes_de_tentar_novamente"))
-    def plano_espera_curta(self, src):
-        """
-        Espera um tempo aleatório curto antes de tentar negociar novamente.
-        """
-        tempo_espera = random.uniform(1.0, 3.0)
-        self.wait(tempo_espera)
-        self.add(Goal("decidir_movimento"))
-        return True
-
-    def encontrar_carro_proximo(self):
-        """
-        Retorna (id_carro, distancia) do carro mais próximo dentro da distância segura.
-        Retorna None se não houver carro próximo.
-        """
-        carro_mais_proximo = None
-        menor_distancia = settings.DISTANCIA_SEGURA_CARRO_PEDESTRE
-        with self.lock:
-            estado_copia = self.estado_compartilhado.copy()
-
-        for key, pos in estado_copia.items():
-            if key.startswith("Carro") and key.endswith("_pos"):
-                dist = calcular_distancia(self.posicao, pos)
-                if dist < menor_distancia:
-                    menor_distancia = dist
-                    id_carro = key.replace("_pos", "")
-                    carro_mais_proximo = (id_carro, dist)
-
-        return carro_mais_proximo
